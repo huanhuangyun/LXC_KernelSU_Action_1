@@ -1,0 +1,211 @@
+name: NX595J 内核编译（Proton Clang 17）
+on:
+  workflow_dispatch:  # 手动触发
+
+jobs:
+  build:
+    name: NX595J + LXC + Docker + KernelSU
+    runs-on: ubuntu-22.04
+    if: github.event.repository.owner.id == github.event.sender.id  # 仅仓库所有者可触发
+
+    steps:
+    # 1. 检出仓库代码
+    - uses: actions/checkout@v4
+
+    # 2. 读取 config.env 环境变量（核心配置从 config.env 读取，无需硬编码）
+    - name: 加载环境变量
+      run: |
+        # 读取 config.env 中所有关键变量并注入 GitHub ENV
+        cat config.env | grep -E "KERNEL_SOURCE=|KERNEL_SOURCE_BRANCH=|KERNEL_CONFIG=|KERNEL_ZIP_NAME=|ENABLE_KVM=|ENABLE_LXC_DOCKER=|KERNEL_IMAGE_NAME=|LLVM_CONFIG=|SWITCH_PYTHON=|NEED_DTBO=|ENABLE_KERNELSU=|KERNELSU_TAG=" >> $GITHUB_ENV
+        # 打印变量验证（可选，便于调试）
+        echo "内核源码地址: ${{ env.KERNEL_SOURCE }}"
+        echo "编译配置文件: ${{ env.KERNEL_CONFIG }}"
+
+    # 3. 构建完整编译环境（重点补充交叉编译工具链和依赖）
+    - name: 安装编译依赖
+      run: |
+        sudo apt-get update -y
+        sudo apt-get install -y --no-install-recommends \
+          git make bc bison ccache openssl zip kmod cpio flex libelf-dev curl libssl-dev libtfm-dev \
+          axel device-tree-compiler ca-certificates python3 python2 \
+          # 关键：安装 ARM64/ARM 交叉编译工具链
+          gcc-aarch64-linux-gnu g++-aarch64-linux-gnu gcc-arm-linux-gnueabi g++-arm-linux-gnueabi \
+          # 补充 dtc 和内核脚本依赖
+          libyaml-dev libncurses5-dev pkg-config libc6-dev
+        # 创建工作目录
+        mkdir -p $GITHUB_WORKSPACE/kernel_workspace
+
+    # 4. 切换 Python 2（如需，根据 config.env 控制）
+    - name: 切换 Python 2.7
+      if: env.SWITCH_PYTHON == 'true'
+      run: |
+        sudo rm -f /usr/bin/python
+        sudo ln -s /usr/bin/python2.7 /usr/bin/python
+        python --version  # 验证切换结果
+
+    # 5. 下载 Proton Clang 17（兼容旧内核，替换问题较多的 ZyC Clang 20）
+    - name: 下载 Proton Clang 编译器
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace
+        mkdir clang-proton
+        # 下载验证过的 Proton Clang 17（适配 MSM8998 内核）
+        axel -q -o proton-clang.tar.gz https://github.com/kdrag0n/proton-clang/releases/download/17.0.1/proton-clang-17.0.1-linux-x86_64.tar.gz
+        tar -zxf proton-clang.tar.gz -C clang-proton --strip-components=1
+        # 验证编译器可用性
+        $GITHUB_WORKSPACE/kernel_workspace/clang-proton/bin/clang --version
+        $GITHUB_WORKSPACE/kernel_workspace/clang-proton/bin/ld.lld --version
+
+    # 6. 下载内核源码（从 config.env 指定的地址拉取）
+    - name: 下载内核源码
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace
+        # 克隆内核源码（--depth=1 加速，--recurse-submodules 拉取子模块）
+        git clone --depth=1 --recurse-submodules ${{ env.KERNEL_SOURCE }} -b ${{ env.KERNEL_SOURCE_BRANCH }} android-kernel
+        # 验证源码目录（确保 drivers/ 等关键目录存在）
+        if [ ! -d "android-kernel/drivers" ]; then
+          echo "ERROR: 内核源码 drivers/ 目录缺失！"
+          exit 1
+        fi
+
+    # 7. 预编译 dtc 工具（用 GCC 规避 Clang 链接错误）
+    - name: 预编译 dtc 设备树编译器
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel/scripts/dtc
+        # 用系统 GCC 编译 dtc，避免 ld.lld 多重定义错误
+        make CC=gcc LD=gcc -j$(nproc)
+        # 验证 dtc 是否生成成功
+        if [ ! -f "dtc" ]; then
+          echo "ERROR: dtc 工具编译失败！"
+          exit 1
+        fi
+
+    # 8. 启用 LXC/Docker 配置（根据 config.env 控制）
+    - name: 开启 LXC/Docker 必需配置
+      if: env.ENABLE_LXC_DOCKER == 'true'
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace
+        # 下载 LXC/Docker 配置文件
+        axel -q https://github.com/jqtmviyu/LXC_KernelSU_Action/raw/refs/heads/main/patches/lxc-docker-config.conf
+        # 追加配置到内核编译配置文件
+        cat lxc-docker-config.conf >> android-kernel/arch/arm64/configs/${{ env.KERNEL_CONFIG }}
+        # 禁用安卓网络限制（避免 LXC ping 权限问题）
+        echo "# CONFIG_ANDROID_PARANOID_NETWORK is not set" >> android-kernel/arch/arm64/configs/${{ env.KERNEL_CONFIG }}
+        # 适配 NX595J 设备（启用 MSM8998 平台 + 禁用其他机型）
+        echo "CONFIG_ARCH_MSM8998=y" >> android-kernel/arch/arm64/configs/${{ env.KERNEL_CONFIG }}
+        echo "CONFIG_MACH_NUBIA_NX595J=y" >> android-kernel/arch/arm64/configs/${{ env.KERNEL_CONFIG }}
+        echo "# CONFIG_MACH_NUBIA_NX609J is not set" >> android-kernel/arch/arm64/configs/${{ env.KERNEL_CONFIG }}
+
+    # 9. 添加 runc 补丁（修复容器运行时兼容性）
+    - name: 应用 runc 补丁
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace
+        # 下载 runc 补丁脚本
+        axel -q https://github.com/jqtmviyu/LXC_KernelSU_Action/raw/refs/heads/main/patches/runcpatch.sh
+        chmod +x runcpatch.sh
+        # 针对不同路径的 cgroup.c 应用补丁
+        if [ -f "android-kernel/kernel/cgroup.c" ]; then
+          ./runcpatch.sh android-kernel/kernel/cgroup.c
+        fi
+        if [ -f "android-kernel/kernel/cgroup/cgroup.c" ]; then
+          ./runcpatch.sh android-kernel/kernel/cgroup/cgroup.c
+        fi
+
+    # 10. 修复 Clang 编译兼容性（关闭冲突选项）
+    - name: 修复 Clang 编译问题
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
+        # 关闭 Clang 不支持的栈保护选项（旧内核常见冲突）
+        sed -i "s/CONFIG_CC_STACKPROTECTOR_STRONG=y/# CONFIG_CC_STACKPROTECTOR_STRONG is not set/g" arch/arm64/configs/${{ env.KERNEL_CONFIG }}
+        # 下载并应用 clangfix2.sh 补丁（修复编译参数）
+        axel -q https://github.com/jqtmviyu/LXC_KernelSU_Action/raw/refs/heads/main/patches/clangfix2.sh
+        chmod +x clangfix2.sh
+        ./clangfix2.sh
+
+    # 11. 配置 KernelSU（根据 config.env 控制，仅支持非 GKI 内核 v0.9.5+）
+    - name: 集成 KernelSU
+      if: env.ENABLE_KERNELSU == 'true'
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
+        # 下载 KernelSU 安装脚本并执行（指定版本）
+        curl -LSs "https://raw.githubusercontent.com/jqtmviyu/KernelSU/095/kernel/setup.sh" | bash -s ${{ env.KERNELSU_TAG }}
+        # 验证 KernelSU 集成结果
+        if [ ! -L "drivers/kernelsu" ]; then
+          echo "ERROR: KernelSU 集成失败！"
+          exit 1
+        fi
+
+    # 12. 开启 KVM（根据 config.env 控制，可选）
+    - name: 启用 KVM 虚拟化
+      if: env.ENABLE_KVM == 'true'
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace
+        # 追加 KVM 配置到内核配置文件
+        echo "CONFIG_VIRTUALIZATION=y" >> android-kernel/arch/arm64/configs/${{ env.KERNEL_CONFIG }}
+        echo "CONFIG_KVM=y" >> android-kernel/arch/arm64/configs/${{ env.KERNEL_CONFIG }}
+        echo "CONFIG_VHOST_NET=y" >> android-kernel/arch/arm64/configs/${{ env.KERNEL_CONFIG }}
+        echo "CONFIG_VHOST_CROSS_ENDIAN_LEGACY=y" >> android-kernel/arch/arm64/configs/${{ env.KERNEL_CONFIG }}
+
+    # 13. 配置 ccache 缓存（加速二次编译）
+    - name: 启用 ccache 缓存
+      uses: hendrikmuhs/ccache-action@v1.2
+      with:
+        key: build-nx595j-kernel-${{ env.KERNEL_CONFIG }}  # 按配置文件区分缓存
+        max-size: 3G  # 缓存最大容量
+
+    # 14. 编译内核（核心步骤，用 Proton Clang 17 确保兼容性）
+    - name: 编译内核
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
+        # 配置编译器路径
+        export PATH=$GITHUB_WORKSPACE/kernel_workspace/clang-proton/bin:$PATH
+        # 配置编译信息（可选，自定义编译者和主机名）
+        export KBUILD_BUILD_USER="NX595J-Builder"
+        export KBUILD_BUILD_HOST="GitHub-Actions"
+        # 1. 生成内核配置（O=out 指定输出目录，避免污染源码）
+        make -j$(nproc) O=out ARCH=arm64 ${{ env.KERNEL_CONFIG }} V=1
+        # 2. 编译内核（根据 LLVM_CONFIG 决定是否启用 LLVM 工具链）
+        if [ "${{ env.LLVM_CONFIG }}" = "y" ]; then
+          make -j$(nproc) CC="ccache clang" CXX="ccache clang++" \
+            O=out ARCH=arm64 \
+            CLANG_TRIPLE="aarch64-linux-gnu-" \
+            CROSS_COMPILE="aarch64-linux-gnu-" \
+            CROSS_COMPILE_ARM32="arm-linux-gnueabi-" \
+            LLVM=1 LLVM_IAS=1 V=1
+        else
+          make -j$(nproc) CC="ccache clang" CXX="ccache clang++" \
+            O=out ARCH=arm64 \
+            CLANG_TRIPLE="aarch64-linux-gnu-" \
+            CROSS_COMPILE="aarch64-linux-gnu-" \
+            CROSS_COMPILE_ARM32="arm-linux-gnueabi-" V=1
+        fi
+        # 验证编译结果（确保目标镜像文件存在）
+        if [ ! -f "out/arch/arm64/boot/${{ env.KERNEL_IMAGE_NAME }}" ]; then
+          echo "ERROR: 内核镜像 ${{ env.KERNEL_IMAGE_NAME }} 未生成！"
+          exit 1
+        fi
+
+    # 15. 用 AnyKernel3 打包内核（生成可刷入的 ZIP）
+    - name: 打包内核为 Flashable ZIP
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace
+        # 克隆 AnyKernel3 模板
+        git clone --depth=1 https://github.com/osm0sis/AnyKernel3
+        cd AnyKernel3
+        # 切换到稳定版本（避免最新版兼容性问题）
+        git checkout 458caeda335554c58930bf6dbfa23e829911e338
+        # 适配 NX595J 设备（修改 AnyKernel 配置）
+        sed -i 's/do.devicecheck=1/do.devicecheck=0/g' anykernel.sh  # 关闭设备校验
+        sed -i 's!block=/dev/block/platform/omap/omap_hsmmc.0/by-name/boot;!block=/dev/block/bootdevice/by-name/boot;!g' anykernel.sh  # 修正 boot 分区路径
+        sed -i 's/is_slot_device=1;/is_slot_device=0;/g' anykernel.sh  # 关闭 AB 分区适配（NX595J 非 AB 分区）
+        # 复制内核镜像到 AnyKernel3 目录
+        cp ../android-kernel/out/arch/arm64/boot/${{ env.KERNEL_IMAGE_NAME }} ./
+        # 清理无用文件（减小 ZIP 体积）
+        rm -rf .git* README.md ramdisk modules patch
+
+    # 16. 上传编译产物（Artifact）
+    - name: 上传内核 ZIP 包
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ env.KERNEL_ZIP_NAME }}  # 自定义 ZIP 名称（从 config.env 读取）
+        path: $GITHUB_WORKSPACE/kernel_workspace/AnyKernel3/*  # 上传所有打包文件
+        retention-days: 7  # 产物保留 7 天（可选，可调整）
