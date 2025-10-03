@@ -100,15 +100,12 @@ jobs:
         key: build-kernel-mido-kernel
         max-size: 2G
 
-    # 在“设置ccache缓存”和“开始编译内核”之间添加以下步骤
-    - name: 手动定义 SCHED_WARN_ON 宏（修复链接错误）
+    # 在“开始编译内核”步骤前添加，替换源码中的调用
+    - name: 替换 SCHED_WARN_ON 为 WARN_ON
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
-        # 向调度器核心文件添加宏定义，确保编译时能识别该符号
-        if ! grep -q "SCHED_WARN_ON" kernel/sched/fair.c; then
-          # 插入包含 WARN_ON 定义的头文件和 SCHED_WARN_ON 宏
-          sed -i '1i #include <linux/warn.h>\n#define SCHED_WARN_ON(cond) WARN_ON(cond)' kernel/sched/fair.c
-        fi
+        # 查找所有调用 SCHED_WARN_ON 的文件并替换为 WARN_ON
+        grep -rl "SCHED_WARN_ON" kernel/sched/ | xargs sed -i 's/SCHED_WARN_ON/WARN_ON/g'
     
     - name: 开始编译内核
       run: |
